@@ -26,9 +26,16 @@ Rules:
 - If error=yes, provide corrected pandas code that sets `result`.
 """
 
-def judge(groq_api_key: str, dataset_card: dict, user_question: str, worker_code: str, worker_tool_result: dict) -> dict:
+def judge(
+    groq_api_key: str,
+    dataset_card: dict,
+    user_question: str,
+    worker_code: str,
+    worker_tool_result: dict,
+    model: str = "openai/gpt-oss-120b",
+) -> dict:
     llm = ChatGroq(
-        model="openai/gpt-oss-120b",
+        model=model,
         temperature=0,
         groq_api_key=groq_api_key,
     )
