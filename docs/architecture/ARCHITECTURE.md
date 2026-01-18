@@ -104,6 +104,7 @@ This system implements a judge-driven, self-improving CSV analysis agent.
 ### Production Considerations
 **Changes Needed**
 - Replace local FAISS with a managed vector store or database.
+- Add Re-ranking.
 - Add structured logging, tracing, and metrics for tool calls and judge results.
 - Harden sandboxing (containerized execution per request).
 
