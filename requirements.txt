@@ -4,4 +4,10 @@ rich==13.9.4
 
 langchain==0.3.7
 langchain-core==0.3.17
+langchain-community==0.3.7
 langchain-groq==0.2.0
+
+sentence-transformers==3.0.1
+faiss-cpu==1.8.0.post1
+torch
+langchain-huggingface

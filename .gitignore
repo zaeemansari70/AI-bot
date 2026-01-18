@@ -3,6 +3,5 @@ __pycache__
 *.pyc
 .DS_Store
 faiss_db
-rules.json
 logs
 .env

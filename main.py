@@ -11,9 +11,9 @@ from langchain_core.tools import tool
 from langchain_core.messages import SystemMessage
 
 import tools as T
+import vectordb
 from judge import judge
 from chat_memory import ChatState
-import rules as R
 
 WORKER_SYSTEM_BASE = """You are a CSV analysis assistant.
 
@@ -38,7 +38,7 @@ Hard rules:
 # Allow enough iterations for label search + pandas_exec.
 MAX_TOOL_ITERS = 6
 
-WORKER_MODEL = "llama-3.3-70b-versatile"
+WORKER_MODEL = "qwen/qwen3-32b"
 JUDGE_MODEL = "openai/gpt-oss-120b"
 
 RISK_PATTERNS = [
@@ -112,6 +112,54 @@ def should_store(decision: dict, corrected_out: dict) -> bool:
     return decision.get("error_type") in {"semantic", "logic"}
 
 
+def extract_rules_from_retrieval(retrieved_docs: list[str]) -> str:
+    rules = []
+    patterns = []
+    for doc in retrieved_docs:
+        for line in doc.splitlines():
+            line = line.strip()
+            if line.startswith("RULE:"):
+                rules.append(line.replace("RULE:", "").strip())
+        if not any("RULE:" in x for x in doc.splitlines()):
+            for line in doc.splitlines():
+                line = line.strip()
+                if line.startswith("ERROR:"):
+                    rules.append("Avoid: " + line.replace("ERROR:", "").strip())
+                    break
+        if "CORRECTED_CODE:" in doc:
+            lines = doc.splitlines()
+            start = None
+            for i, line in enumerate(lines):
+                if line.strip().startswith("CORRECTED_CODE:"):
+                    start = i + 1
+                    break
+            if start is not None:
+                buf = []
+                for line in lines[start:]:
+                    if line.strip().startswith("WRONG_CODE"):
+                        break
+                    buf.append(line)
+                code = "\n".join(buf).strip()
+                if code:
+                    code = re.sub(r"\b\d+(\.\d+)?\b", "<NUM>", code)
+                    patterns.append(code)
+
+    rules = [r for r in rules if r][:6]
+    patterns = [p for p in patterns if p][:2]
+    if not rules and not patterns:
+        return ""
+
+    block = "Learned rules (MUST follow these patterns):\n"
+    for i, r in enumerate(rules, 1):
+        block += f"{i}. {r}\n"
+    if patterns:
+        block += "Example corrected pandas patterns (do not copy numbers):\n"
+        for i, p in enumerate(patterns, 1):
+            block += f"Pattern {i}:\n{p}\n"
+    block += "Reminder: use these as patterns only, never copy numeric outputs from memory.\n"
+    return block
+
+
 def main():
     load_dotenv()
     api_key = os.getenv("GROQ_API_KEY")
@@ -182,7 +230,8 @@ def main():
 
     state = ChatState(system_base=WORKER_SYSTEM_BASE)
     state.init()
-    pending_rules = []
+    pending_mistakes = []
+    disable_write = os.getenv("VDB_DISABLE_WRITE", "0").strip() == "1"
 
     while True:
         q = input("\nYou: ").strip()
@@ -193,8 +242,8 @@ def main():
             print("\n[bold cyan]Bot:[/bold cyan] Exiting and saving learning (if any).")
             break
 
-        matched_rules = R.match_rules(q)
-        learned_rules_block = R.format_rules(matched_rules)
+        retrieved = vectordb.search_similar(q, k=3)
+        learned_rules_block = extract_rules_from_retrieval(retrieved)
 
         state.rebuild_system_message()
         system_text = state.system_prompt()
@@ -245,7 +294,6 @@ def main():
                         last_code = args.get("code", "")
                         out = pandas_exec.invoke(args)
                         last_tool_result = out
-                        last_tool_name = "pandas_exec"
 
                     elif name == "get_uniques":
                         out = get_uniques.invoke(args)
@@ -306,14 +354,16 @@ def main():
             if decision.get("error") == "yes" and decision.get("corrected_code"):
                 corrected_out = T.run_pandas(decision["corrected_code"])
                 if should_store(decision, corrected_out):
-                    rule = R.build_rule(
-                        question=q,
-                        error_description=f"{decision.get('error_type')}: {decision.get('error_description')}",
-                        corrected_code=decision["corrected_code"],
-                        wrong_code=last_code,
+                    pending_mistakes.append(
+                        {
+                            "question": q,
+                            "wrong_code": last_code,
+                            "error_description": f"{decision.get('error_type')}: {decision.get('error_description')}",
+                            "rule": (decision.get("error_description") or "").strip(),
+                            "corrected_code": decision["corrected_code"],
+                        }
                     )
-                    pending_rules.append(rule)
-                    print("\n[bold yellow]Learning event:[/bold yellow] Queued fix for rules.json.")
+                    print("\n[bold yellow]Learning event:[/bold yellow] Queued fix for FAISS.")
 
         if is_numeric_question(q) and not last_code:
             guard = (
@@ -330,9 +380,13 @@ def main():
         print(worker_answer)
         print()
 
-    if pending_rules:
-        R.add_rules(pending_rules)
-        print(f"\n[bold yellow]Learning event:[/bold yellow] Stored {len(pending_rules)} fix(es) in rules.json.")
+    if pending_mistakes and not disable_write:
+        print(f"\n[bold yellow]Learning event:[/bold yellow] Storing {len(pending_mistakes)} fix(es) in FAISS...")
+        for entry in pending_mistakes:
+            vectordb.add_mistake(entry)
+        print(f"[bold yellow]Learning event:[/bold yellow] Stored {len(pending_mistakes)} fix(es) in FAISS.")
+    elif pending_mistakes and disable_write:
+        print(f"\n[bold yellow]Learning event:[/bold yellow] Skipped storing {len(pending_mistakes)} fix(es) (VDB_DISABLE_WRITE=1).")
     else:
         print("\n[bold yellow]Learning event:[/bold yellow] No queued fixes to store.")
 
