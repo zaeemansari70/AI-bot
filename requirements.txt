@@ -1,0 +1,7 @@
+python-dotenv==1.0.1
+pandas==2.2.3
+rich==13.9.4
+
+langchain==0.3.7
+langchain-core==0.3.17
+langchain-groq==0.2.0
