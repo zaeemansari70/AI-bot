@@ -110,12 +110,15 @@ def search_uniques(column: str, contains: str, limit: int = 50) -> Dict[str, Any
         return {"ok": False, "error_type": "TOOL_INPUT", "error": f"Unknown column: {column}", "values": []}
 
     needle = (contains or "").strip().lower()
-    if not needle:
-        return {"ok": False, "error_type": "TOOL_INPUT", "error": "contains must be non-empty", "values": []}
-
     vals = df[column].dropna().astype(str).unique().tolist()
+    vals = sorted(vals)
+
+    if not needle:
+        # Fallback: return a small sample of uniques to keep the tool usable.
+        vals = vals[: max(1, min(int(limit), 200))]
+        return {"ok": True, "values": vals, "match_count": len(vals)}
+
     matches = [v for v in vals if needle in v.lower()]
-    matches = sorted(matches)
     matches = matches[: max(1, min(int(limit), 200))]
 
     return {"ok": True, "values": matches, "match_count": len(matches)}
@@ -269,4 +272,3 @@ def search_fsline_l1(query: str, limit: int = 10) -> Dict[str, Any]:
             matches.append({"value": v, "count": int(c)})
 
     return {"ok": True, "matches": matches[: max(1, min(limit, 50))]}
-

@@ -19,6 +19,9 @@ WORKER_SYSTEM_BASE = """You are a CSV analysis assistant.
 
 Hard rules:
 - ALWAYS use tools to compute. Never guess numbers.
+- You MUST call pandas_exec for EVERY user question and return a tool call.
+- You may call helper tools (search_uniques, search_fsline_l1/l2, value_exists) before pandas_exec,
+  but you must always call pandas_exec in the same request.
 - For compare/percentage/growth/margin/YoY you MUST use pandas_exec.
 - If you are unsure about exact labels (e.g., "Gross Revenue", "Cost of Goods Sold"),
   you MUST call search_uniques on the relevant column (usually "FSLine Statement L2")
@@ -57,17 +60,9 @@ RISK_PATTERNS = [
     r"\bnet revenue\b",
 ]
 
-NUMERIC_KEYWORDS = ["how much", "total", "sum", "revenue", "expenses", "profit", "amount", "growth", "margin", "percent"]
-
-
 def is_high_risk_question(q: str) -> bool:
     s = (q or "").lower()
     return any(re.search(p, s) for p in RISK_PATTERNS)
-
-
-def is_numeric_question(q: str) -> bool:
-    s = (q or "").lower()
-    return any(k in s for k in NUMERIC_KEYWORDS)
 
 
 def safe_llm_invoke(llm, messages, retries: int = 1):
@@ -233,34 +228,9 @@ def main():
     pending_mistakes = []
     disable_write = os.getenv("VDB_DISABLE_WRITE", "0").strip() == "1"
 
-    while True:
-        q = input("\nYou: ").strip()
-        if not q:
-            continue
-        q_lower = q.lower()
-        if q_lower == "exit" or q_lower.startswith("exit "):
-            print("\n[bold cyan]Bot:[/bold cyan] Exiting and saving learning (if any).")
-            break
-
-        retrieved = vectordb.search_similar(q, k=3)
-        learned_rules_block = extract_rules_from_retrieval(retrieved)
-
-        state.rebuild_system_message()
-        system_text = state.system_prompt()
-        if learned_rules_block:
-            system_text = system_text + "\n\n" + learned_rules_block
-        state.messages[0] = SystemMessage(content=system_text)
-
-        state.add_user(q)
-
-        resp = safe_llm_invoke(worker, state.messages, retries=1)
-
-        last_code = ""
-        last_tool_result = {}
-        dataset_card = {}
-
+    def run_tool_loop(resp):
+        nonlocal last_code, last_tool_result, dataset_card
         tool_iters = 0
-
         while getattr(resp, "tool_calls", None):
             tool_iters += 1
             if tool_iters > MAX_TOOL_ITERS:
@@ -273,8 +243,7 @@ def main():
                 state.add_ai(fail_msg)
                 print("\n[bold cyan]Bot:[/bold cyan]")
                 print(fail_msg)
-                resp = None
-                break
+                return None
 
             state.messages.append(resp)
 
@@ -326,8 +295,57 @@ def main():
 
             resp = safe_llm_invoke(worker, state.messages, retries=1)
 
+        return resp
+
+    def force_pandas_exec():
+        nonlocal last_code, last_tool_result, dataset_card
+        force = (
+            "You must call pandas_exec to answer this question. "
+            "Return a tool call with valid JSON args. Do not answer in prose."
+        )
+        force_msg = SystemMessage(content=force)
+        state.messages.append(force_msg)
+        resp = safe_llm_invoke(worker, state.messages, retries=1)
+        state.messages.remove(force_msg)
+
+        last_code = ""
+        last_tool_result = {}
+        dataset_card = {}
+        return run_tool_loop(resp)
+
+    while True:
+        q = input("\nYou: ").strip()
+        if not q:
+            continue
+        q_lower = q.lower()
+        if q_lower == "exit" or q_lower.startswith("exit "):
+            print("\n[bold cyan]Bot:[/bold cyan] Exiting and saving learning (if any).")
+            break
+
+        retrieved = vectordb.search_similar(q, k=3)
+        learned_rules_block = extract_rules_from_retrieval(retrieved)
+
+        state.rebuild_system_message()
+        system_text = state.system_prompt()
+        if learned_rules_block:
+            system_text = system_text + "\n\n" + learned_rules_block
+        state.messages[0] = SystemMessage(content=system_text)
+
+        state.add_user(q)
+
+        last_code = ""
+        last_tool_result = {}
+        dataset_card = {}
+        resp = safe_llm_invoke(worker, state.messages, retries=1)
+        resp = run_tool_loop(resp)
+
         if resp is None:
             continue
+
+        if not last_code:
+            resp = force_pandas_exec()
+            if resp is None:
+                continue
 
         worker_answer = resp.content
         state.add_ai(worker_answer)
@@ -365,9 +383,9 @@ def main():
                     )
                     print("\n[bold yellow]Learning event:[/bold yellow] Queued fix for FAISS.")
 
-        if is_numeric_question(q) and not last_code:
+        if not last_code:
             guard = (
-                "I need to run a pandas query to answer numeric questions, but no pandas code was executed. "
+                "I need to run a pandas query to answer this question, but no pandas code was executed. "
                 "Please re-ask the question so I can compute it using tools."
             )
             state.add_ai(guard)
