@@ -47,6 +47,7 @@ MAX_TOOL_ITERS = 10
 
 WORKER_MODEL = "qwen/qwen3-32b"
 JUDGE_MODEL = "openai/gpt-oss-120b"
+DEFAULT_HISTORY_MESSAGES = 18
 
 ANSWER_SYSTEM = """You are a CSV analysis assistant.
 
@@ -57,26 +58,6 @@ Return a structured response with:
 3) Method
 4) Sanity check
 If the computed result is a string error message, treat it as the final answer and explain the validation."""
-
-RISK_PATTERNS = [
-    r"\byoy\b",
-    r"year[- ]over[- ]year",
-    r"\bgrowth\b",
-    r"\bmargin\b",
-    r"\bpercent\b",
-    r"\bpercentage\b",
-    r"\bcompare\b",
-    r"\bdifference\b",
-    r"\bdelta\b",
-    r"\brate\b",
-    r"\baverage\b",
-    r"\bmedian\b",
-    r"\bnet revenue\b",
-]
-
-def is_high_risk_question(q: str) -> bool:
-    s = (q or "").lower()
-    return any(re.search(p, s) for p in RISK_PATTERNS)
 
 
 def safe_llm_invoke(llm, messages, retries: int = 1):
@@ -112,13 +93,7 @@ def should_store(decision: dict, corrected_out: dict) -> bool:
         return False
     if not corrected_out.get("ok", False):
         return False
-
-    if decision.get("error_type") == "runtime":
-        desc = (decision.get("error_description") or "").lower()
-        allow = ["unknown column", "missing column", "keyerror", "column not found"]
-        return any(x in desc for x in allow)
-
-    return decision.get("error_type") in {"semantic", "logic"}
+    return True
 
 
 def extract_rules_from_retrieval(retrieved_docs: list[str]) -> str:
@@ -167,6 +142,16 @@ def extract_rules_from_retrieval(retrieved_docs: list[str]) -> str:
             block += f"Pattern {i}:\n{p}\n"
     block += "Reminder: use these as patterns only, never copy numeric outputs from memory.\n"
     return block
+
+
+def trim_history(state: ChatState, keep_last: int) -> None:
+    if keep_last < 2:
+        return
+    if len(state.messages) <= keep_last + 1:
+        return
+    system = state.messages[0]
+    tail = state.messages[-keep_last:]
+    state.messages = [system] + tail
 
 
 def _format_list(values: list[str], limit: int = 30) -> str:
@@ -270,6 +255,9 @@ def metadata_response(q: str, card: dict) -> str | None:
     wants_cols = bool(
         re.search(r"\bhow many columns\b|\bcolumn count\b|\bnumber of columns\b|\brows and columns\b", q_lower)
     )
+    if "rows" in q_lower and "columns" in q_lower:
+        wants_rows = True
+        wants_cols = True
     if "column names" in q_lower or ("columns" in q_lower and any(w in q_lower for w in ["csv", "dataset", "file"])):
         wants_cols = True
 
@@ -409,7 +397,7 @@ def extract_simple_filters(q: str, card: dict) -> dict | None:
     }
 
 
-def auto_answer_simple(q: str, card: dict) -> str | None:
+def auto_answer_simple(q: str, card: dict) -> dict | None:
     parsed = extract_simple_filters(q, card)
     if not parsed:
         return None
@@ -445,7 +433,12 @@ def auto_answer_simple(q: str, card: dict) -> str | None:
     if count_out.get("ok"):
         sanity = f"Rows matched: {count_out.get('count')}."
 
-    return format_structured_response(final, parsed["filters"], method, sanity)
+    fallback_answer = format_structured_response(final, parsed["filters"], method, sanity)
+    return {
+        "code": code,
+        "tool_result": out,
+        "fallback_answer": fallback_answer,
+    }
 
 
 def render_answer(llm, question: str, pandas_code: str, tool_result: dict) -> str:
@@ -470,7 +463,7 @@ def main():
         raise RuntimeError("GROQ_API_KEY missing in .env")
 
     debug_tools = os.getenv("DEBUG_TOOLS", "0").strip() == "1"
-    always_judge = os.getenv("ALWAYS_JUDGE", "0").strip() == "1"
+    history_keep = int(os.getenv("MAX_HISTORY_MESSAGES", str(DEFAULT_HISTORY_MESSAGES)))
     worker_model = os.getenv("WORKER_MODEL", WORKER_MODEL)
     judge_model = os.getenv("JUDGE_MODEL", JUDGE_MODEL)
 
@@ -549,6 +542,13 @@ def main():
     state.init()
     pending_mistakes = []
     disable_write = os.getenv("VDB_DISABLE_WRITE", "0").strip() == "1"
+
+    def emit_answer(text: str) -> None:
+        state.add_ai(text)
+        print("\n[bold cyan]Bot:[/bold cyan]")
+        print(text)
+        print()
+        trim_history(state, history_keep)
 
     def run_tool_loop(resp):
         nonlocal last_code, last_tool_result, dataset_card, tool_loop_exceeded
@@ -640,19 +640,13 @@ def main():
         meta_msg = metadata_response(q, base_dataset_card)
         if meta_msg:
             state.add_user(q)
-            state.add_ai(meta_msg)
-            print("\n[bold cyan]Bot:[/bold cyan]")
-            print(meta_msg)
-            print()
+            emit_answer(meta_msg)
             continue
 
         validation_msg = preflight_validation(q, base_dataset_card)
         if validation_msg:
             state.add_user(q)
-            state.add_ai(validation_msg)
-            print("\n[bold cyan]Bot:[/bold cyan]")
-            print(validation_msg)
-            print()
+            emit_answer(validation_msg)
             continue
 
         retrieved = vectordb.search_similar(q, k=3)
@@ -670,127 +664,129 @@ def main():
         last_tool_result = {}
         dataset_card = {}
         tool_loop_exceeded = False
+        fallback_bundle = None
         resp = safe_llm_invoke(worker, state.messages, retries=1)
         resp = run_tool_loop(resp)
 
         if tool_loop_exceeded:
-            fallback = auto_answer_simple(q, base_dataset_card)
-            if fallback:
-                state.add_ai(fallback)
-                print("\n[bold cyan]Bot:[/bold cyan]")
-                print(fallback)
-                print()
-                continue
-            fail_msg = (
-                f"I started looping on tool calls and stopped to avoid hanging. "
-                f"(max iterations={MAX_TOOL_ITERS})\n"
-                "Tip: The model is probably failing to find the exact dataset label for a metric. "
-                "Try asking with exact FSLine names or enable DEBUG_TOOLS=1 to see the tool loop.\n"
-            )
-            state.add_ai(fail_msg)
-            print("\n[bold cyan]Bot:[/bold cyan]")
-            print(fail_msg)
-            continue
-
-        if resp is None:
-            continue
-
-        if not last_code:
-            resp = force_pandas_exec()
-            if tool_loop_exceeded:
-                fallback = auto_answer_simple(q, base_dataset_card)
-                if fallback:
-                    state.add_ai(fallback)
-                    print("\n[bold cyan]Bot:[/bold cyan]")
-                    print(fallback)
-                    print()
-                    continue
+            fallback_bundle = auto_answer_simple(q, base_dataset_card)
+            if fallback_bundle:
+                last_code = fallback_bundle["code"]
+                last_tool_result = fallback_bundle["tool_result"]
+                tool_loop_exceeded = False
+            else:
                 fail_msg = (
                     f"I started looping on tool calls and stopped to avoid hanging. "
                     f"(max iterations={MAX_TOOL_ITERS})\n"
                     "Tip: The model is probably failing to find the exact dataset label for a metric. "
                     "Try asking with exact FSLine names or enable DEBUG_TOOLS=1 to see the tool loop.\n"
                 )
-                state.add_ai(fail_msg)
-                print("\n[bold cyan]Bot:[/bold cyan]")
-                print(fail_msg)
-                continue
-            if resp is None:
+                emit_answer(fail_msg)
                 continue
 
-        worker_answer = resp.content
+        if resp is None and not last_code:
+            continue
+
+        if not last_code:
+            resp = force_pandas_exec()
+            if tool_loop_exceeded:
+                fallback_bundle = auto_answer_simple(q, base_dataset_card)
+                if fallback_bundle:
+                    last_code = fallback_bundle["code"]
+                    last_tool_result = fallback_bundle["tool_result"]
+                    tool_loop_exceeded = False
+                else:
+                    fail_msg = (
+                        f"I started looping on tool calls and stopped to avoid hanging. "
+                        f"(max iterations={MAX_TOOL_ITERS})\n"
+                        "Tip: The model is probably failing to find the exact dataset label for a metric. "
+                        "Try asking with exact FSLine names or enable DEBUG_TOOLS=1 to see the tool loop.\n"
+                    )
+                    emit_answer(fail_msg)
+                    continue
+            if resp is None and not last_code:
+                continue
 
         if not dataset_card:
             dataset_card = base_dataset_card
 
-        need_judge = False
-        if last_tool_result and (last_tool_result.get("ok") is False):
-            need_judge = True
-        if is_high_risk_question(q):
-            need_judge = True
-        if always_judge:
-            need_judge = True
-
-        if need_judge:
-            decision = judge(
-                groq_api_key=api_key,
-                dataset_card=dataset_card,
-                user_question=q,
-                worker_code=last_code,
-                worker_tool_result=last_tool_result,
-                model=judge_model,
-            )
-            if decision.get("error") == "yes" and decision.get("corrected_code"):
-                corrected_out = T.run_pandas(decision["corrected_code"])
-                if should_store(decision, corrected_out):
-                    pending_mistakes.append(
-                        {
-                            "question": q,
-                            "wrong_code": last_code,
-                            "error_description": f"{decision.get('error_type')}: {decision.get('error_description')}",
-                            "rule": (decision.get("error_description") or "").strip(),
-                            "corrected_code": decision["corrected_code"],
-                        }
-                    )
-                    print("\n[bold yellow]Learning event:[/bold yellow] Queued fix for FAISS.")
-                if corrected_out.get("ok"):
-                    try:
-                        worker_answer = render_answer(
-                            writer,
-                            question=q,
-                            pandas_code=decision["corrected_code"],
-                            tool_result=corrected_out,
-                        )
-                    except Exception:
-                        worker_answer = format_structured_response(
-                            final_answer=str(corrected_out.get("result")),
-                            filters=None,
-                            method="Used judge-corrected pandas code.",
-                            sanity="Correction applied; filters derived from corrected code.",
-                        )
-
         if not last_code:
-            fallback = auto_answer_simple(q, base_dataset_card)
-            if fallback:
-                state.add_ai(fallback)
-                print("\n[bold cyan]Bot:[/bold cyan]")
-                print(fallback)
-                print()
+            fallback_bundle = auto_answer_simple(q, base_dataset_card)
+            if fallback_bundle:
+                last_code = fallback_bundle["code"]
+                last_tool_result = fallback_bundle["tool_result"]
+            else:
+                guard = (
+                    "I need to run a pandas query to answer this question, but no pandas code was executed. "
+                    "Please re-ask the question so I can compute it using tools."
+                )
+                emit_answer(guard)
                 continue
+        if not last_tool_result:
             guard = (
                 "I need to run a pandas query to answer this question, but no pandas code was executed. "
                 "Please re-ask the question so I can compute it using tools."
             )
-            state.add_ai(guard)
-            print("\n[bold cyan]Bot:[/bold cyan]")
-            print(guard)
-            print()
+            emit_answer(guard)
             continue
 
-        state.add_ai(worker_answer)
-        print("\n[bold cyan]Bot:[/bold cyan]")
-        print(worker_answer)
-        print()
+        final_code = last_code
+        final_result = last_tool_result
+        decision = judge(
+            groq_api_key=api_key,
+            dataset_card=dataset_card,
+            user_question=q,
+            worker_code=last_code,
+            worker_tool_result=last_tool_result,
+            model=judge_model,
+            dataset_context=dataset_ctx,
+        )
+        if decision.get("error") == "yes" and decision.get("corrected_code"):
+            corrected_out = T.run_pandas(decision["corrected_code"])
+            if should_store(decision, corrected_out):
+                pending_mistakes.append(
+                    {
+                        "question": q,
+                        "wrong_code": last_code,
+                        "error_description": f"{decision.get('error_type')}: {decision.get('error_description')}",
+                        "rule": (decision.get("error_description") or "").strip(),
+                        "corrected_code": decision["corrected_code"],
+                    }
+                )
+                print("\n[bold yellow]Learning event:[/bold yellow] Queued fix for FAISS.")
+            if corrected_out.get("ok"):
+                final_code = decision["corrected_code"]
+                final_result = corrected_out
+
+        if not final_result.get("ok", True):
+            error_text = final_result.get("error") or "Unknown error"
+            answer = format_structured_response(
+                final_answer=f"Analysis failed: {error_text}",
+                filters=None,
+                method="Pandas execution reported an error.",
+                sanity="No numeric result produced.",
+            )
+            emit_answer(answer)
+            continue
+
+        try:
+            answer = render_answer(
+                writer,
+                question=q,
+                pandas_code=final_code,
+                tool_result=final_result,
+            )
+        except Exception:
+            if fallback_bundle and fallback_bundle.get("fallback_answer"):
+                answer = fallback_bundle["fallback_answer"]
+            else:
+                answer = format_structured_response(
+                    final_answer=str(final_result.get("result")),
+                    filters=None,
+                    method="Rendered from latest tool result.",
+                    sanity="Answer derived from pandas output.",
+                )
+        emit_answer(answer)
 
     if pending_mistakes and not disable_write:
         print(f"\n[bold yellow]Learning event:[/bold yellow] Storing {len(pending_mistakes)} fix(es) in FAISS...")

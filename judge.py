@@ -33,12 +33,17 @@ def judge(
     worker_code: str,
     worker_tool_result: dict,
     model: str = "openai/gpt-oss-120b",
+    dataset_context: str | None = None,
 ) -> dict:
     llm = ChatGroq(
         model=model,
         temperature=0,
         groq_api_key=groq_api_key,
     )
+
+    system_text = JUDGE_SYSTEM
+    if dataset_context:
+        system_text = system_text + "\nDataset context:\n" + dataset_context + "\n"
 
     payload = {
         "dataset_card": dataset_card,
@@ -49,7 +54,7 @@ def judge(
 
     resp = llm.invoke(
         [
-            SystemMessage(content=JUDGE_SYSTEM),
+            SystemMessage(content=system_text),
             HumanMessage(content=json.dumps(payload, indent=2)),
         ]
     )
